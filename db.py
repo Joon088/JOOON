@@ -1,20 +1,97 @@
 from datetime import datetime, date, timedelta
+import json
+import random
+import psycopg2
+import psycopg2.extras
+
+from config import DATABASE_URL
 
 START_MONEY = 50000
 
-users = {}
-jails = {}
+# ⚠️ 실제 운영 가격으로 돌릴 때는 500_000_000 추천
+CASINO_PRICE = 500_000_000
 
 
-def get_user(user_id: int):
-    return users.get(user_id)
+# =========================
+# PostgreSQL 기본 함수
+# =========================
+
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
+
+    return psycopg2.connect(DATABASE_URL)
 
 
-def create_user(user_id: int, username: str):
-    if user_id in users:
+def _json_default(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+
+def _to_jsonb(data):
+    return json.dumps(data, default=_json_default, ensure_ascii=False)
+
+
+def _parse_datetime(value):
+    if not value:
         return None
 
-    users[user_id] = {
+    if isinstance(value, datetime):
+        return value
+
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _parse_date(value):
+    if not value:
+        return None
+
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+
+    try:
+        return date.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_users (
+                    user_id BIGINT PRIMARY KEY,
+                    data JSONB NOT NULL
+                );
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS guild_data (
+                    guild_id BIGINT PRIMARY KEY,
+                    data JSONB NOT NULL
+                );
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_global (
+                    key TEXT PRIMARY KEY,
+                    data JSONB NOT NULL
+                );
+            """)
+
+    init_stocks()
+
+
+# =========================
+# 기본 데이터
+# =========================
+
+def default_user(user_id: int, username: str):
+    return {
         "user_id": user_id,
         "username": username,
         "money": START_MONEY,
@@ -27,14 +104,124 @@ def create_user(user_id: int, username: str):
         "total_lose": 0,
         "last_interest_date": None,
         "properties": [],
-        "last_property_income": None,
+        "property_last_claim": None,
+        "stocks": {},
     }
 
-    return users[user_id]
+
+def normalize_user(user):
+    if not user:
+        return None
+
+    user.setdefault("bank", 0)
+    user.setdefault("debt", 0)
+    user.setdefault("vip", "Bronze")
+    user.setdefault("credit", "B")
+    user.setdefault("total_bet", 0)
+    user.setdefault("total_win", 0)
+    user.setdefault("total_lose", 0)
+    user.setdefault("last_interest_date", None)
+    user.setdefault("properties", [])
+    user.setdefault("property_last_claim", None)
+    user.setdefault("stocks", {})
+
+    user["last_interest_date"] = _parse_date(user.get("last_interest_date"))
+    user["property_last_claim"] = _parse_datetime(user.get("property_last_claim"))
+
+    return user
+
+
+def default_guild_data():
+    return {
+        "jackpot": {
+            "amount": 0,
+            "last_winner": None,
+            "last_amount": 0
+        },
+        "settings": {
+            "notice_channel": None,
+            "lotto_channel": None,
+            "jackpot_channel": None,
+            "stock_channel": None
+        },
+        "lotto_tickets": [],
+        "lotto_last_draw_date": None,
+        "casino": {
+            "owner_id": None,
+            "value": CASINO_PRICE,
+            "vault": 0,
+            "total_profit": 0,
+            "protected_until": None
+        }
+    }
+
+
+def normalize_guild_data(data):
+    if not data:
+        data = default_guild_data()
+
+    default = default_guild_data()
+
+    for key, value in default.items():
+        data.setdefault(key, value)
+
+    for key, value in default["settings"].items():
+        data["settings"].setdefault(key, value)
+
+    for key, value in default["jackpot"].items():
+        data["jackpot"].setdefault(key, value)
+
+    for key, value in default["casino"].items():
+        data["casino"].setdefault(key, value)
+
+    data["casino"]["protected_until"] = _parse_datetime(
+        data["casino"].get("protected_until")
+    )
+
+    return data
+
+
+def save_user(user_id: int, user: dict):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_users (user_id, data)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (user_id)
+                DO UPDATE SET data = EXCLUDED.data
+                """,
+                (user_id, _to_jsonb(user))
+            )
+
+
+def get_user(user_id: int):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT data FROM bot_users WHERE user_id = %s",
+                (user_id,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    return normalize_user(dict(row["data"]))
+
+
+def create_user(user_id: int, username: str):
+    if get_user(user_id):
+        return None
+
+    user = default_user(user_id, username)
+    save_user(user_id, user)
+
+    return user
 
 
 def is_registered(user_id: int):
-    return user_id in users
+    return get_user(user_id) is not None
 
 
 def get_money(user_id: int):
@@ -44,13 +231,80 @@ def get_money(user_id: int):
     return user["money"]
 
 
+def get_guild_data(guild_id: int):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT data FROM guild_data WHERE guild_id = %s",
+                (guild_id,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        data = default_guild_data()
+        save_guild_data(guild_id, data)
+        return normalize_guild_data(data)
+
+    return normalize_guild_data(dict(row["data"]))
+
+
+def save_guild_data(guild_id: int, data: dict):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO guild_data (guild_id, data)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (guild_id)
+                DO UPDATE SET data = EXCLUDED.data
+                """,
+                (guild_id, _to_jsonb(data))
+            )
+
+
+def get_global_data(key: str, default):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT data FROM bot_global WHERE key = %s",
+                (key,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        save_global_data(key, default)
+        return default
+
+    return row["data"]
+
+
+def save_global_data(key: str, data):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_global (key, data)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (key)
+                DO UPDATE SET data = EXCLUDED.data
+                """,
+                (key, _to_jsonb(data))
+            )
+
+
+# =========================
+# 돈 / 은행 / 대출 / VIP
+# =========================
+
 def add_money(user_id: int, amount: int):
     user = get_user(user_id)
     if not user:
         return None
 
     user["money"] += amount
-    update_vip(user_id)
+    update_vip_data(user)
+
+    save_user(user_id, user)
     return user["money"]
 
 
@@ -60,7 +314,9 @@ def remove_money(user_id: int, amount: int):
         return None
 
     user["money"] -= amount
-    update_vip(user_id)
+    update_vip_data(user)
+
+    save_user(user_id, user)
     return user["money"]
 
 
@@ -74,8 +330,9 @@ def deposit_money(user_id: int, amount: int):
 
     user["money"] -= amount
     user["bank"] += amount
-    update_vip(user_id)
+    update_vip_data(user)
 
+    save_user(user_id, user)
     return user
 
 
@@ -89,8 +346,9 @@ def withdraw_money(user_id: int, amount: int):
 
     user["bank"] -= amount
     user["money"] += amount
-    update_vip(user_id)
+    update_vip_data(user)
 
+    save_user(user_id, user)
     return user
 
 
@@ -104,6 +362,9 @@ def get_total_asset(user_id: int):
 
 def get_vip_data(user_id: int):
     asset = get_total_asset(user_id)
+
+    if asset is None:
+        return "Bronze", 500_000, 5
 
     if asset >= 1_000_000_000:
         return "Black", 50_000_000, 1
@@ -120,15 +381,30 @@ def get_vip_data(user_id: int):
     return "Bronze", 500_000, 5
 
 
+def update_vip_data(user: dict):
+    asset = user["money"] + user["bank"] - user["debt"]
+
+    if asset >= 1_000_000_000:
+        user["vip"] = "Black"
+    elif asset >= 100_000_000:
+        user["vip"] = "Diamond"
+    elif asset >= 10_000_000:
+        user["vip"] = "Gold"
+    elif asset >= 1_000_000:
+        user["vip"] = "Silver"
+    else:
+        user["vip"] = "Bronze"
+
+
 def update_vip(user_id: int):
     user = get_user(user_id)
     if not user:
         return None
 
-    vip, limit, interest = get_vip_data(user_id)
-    user["vip"] = vip
+    update_vip_data(user)
+    save_user(user_id, user)
 
-    return vip
+    return user["vip"]
 
 
 def get_loan_limit(user_id: int):
@@ -148,8 +424,9 @@ def add_debt(user_id: int, amount: int):
 
     user["debt"] += amount
     user["money"] += amount
-    update_vip(user_id)
+    update_vip_data(user)
 
+    save_user(user_id, user)
     return user
 
 
@@ -166,8 +443,9 @@ def repay_debt(user_id: int, amount: int):
 
     user["money"] -= amount
     user["debt"] -= amount
-    update_vip(user_id)
+    update_vip_data(user)
 
+    save_user(user_id, user)
     return user
 
 
@@ -180,6 +458,7 @@ def apply_daily_interest(user_id: int):
 
     if user["debt"] <= 0:
         user["last_interest_date"] = today
+        save_user(user_id, user)
         return 0
 
     if user["last_interest_date"] == today:
@@ -190,61 +469,11 @@ def apply_daily_interest(user_id: int):
 
     user["debt"] += interest
     user["last_interest_date"] = today
-    update_vip(user_id)
+    update_vip_data(user)
 
+    save_user(user_id, user)
     return interest
 
-
-def set_jail(user_id: int, until_time):
-    jails[user_id] = until_time
-
-
-def get_jail(user_id: int):
-    return jails.get(user_id)
-
-
-def is_jailed(user_id: int):
-    until_time = jails.get(user_id)
-
-    if not until_time:
-        return False
-
-    if datetime.now() >= until_time:
-        del jails[user_id]
-        return False
-
-    return True
-
-
-def get_jail_remaining(user_id: int):
-    until_time = jails.get(user_id)
-
-    if not until_time:
-        return None
-
-    remaining = until_time - datetime.now()
-
-    if remaining.total_seconds() <= 0:
-        del jails[user_id]
-        return None
-
-    return remaining
-
-
-def clear_jail(user_id: int):
-    if user_id in jails:
-        del jails[user_id]
-
-
-def add_jail_time(user_id: int, minutes: int):
-    until_time = jails.get(user_id)
-
-    if not until_time or datetime.now() >= until_time:
-        jails[user_id] = datetime.now() + timedelta(minutes=minutes)
-    else:
-        jails[user_id] = until_time + timedelta(minutes=minutes)
-
-    return jails[user_id]
 
 def get_vip_display(user_id: int):
     user = get_user(user_id)
@@ -252,6 +481,7 @@ def get_vip_display(user_id: int):
         return "🥉 Bronze"
 
     update_vip(user_id)
+    user = get_user(user_id)
     vip = user["vip"]
 
     vip_icons = {
@@ -264,10 +494,38 @@ def get_vip_display(user_id: int):
 
     return vip_icons.get(vip, "🥉 Bronze")
 
+
+def get_vip_color(user_id: int):
+    user = get_user(user_id)
+
+    if not user:
+        return 0xCD7F32
+
+    update_vip(user_id)
+    user = get_user(user_id)
+
+    colors = {
+        "Bronze": 0xCD7F32,
+        "Silver": 0xC0C0C0,
+        "Gold": 0xFFD700,
+        "Diamond": 0x00FFFF,
+        "Black": 0x2C2F33
+    }
+
+    return colors.get(user["vip"], 0xCD7F32)
+
+
 def get_ranking():
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT user_id, data FROM bot_users")
+            rows = cur.fetchall()
+
     ranking = []
 
-    for user_id, user in users.items():
+    for row in rows:
+        user_id = int(row["user_id"])
+        user = normalize_user(dict(row["data"]))
         total_asset = user["money"] + user["bank"] - user["debt"]
 
         ranking.append({
@@ -280,51 +538,115 @@ def get_ranking():
             "vip": user["vip"]
         })
 
-    ranking.sort(
-        key=lambda x: x["total_asset"],
-        reverse=True
-    )
-
+    ranking.sort(key=lambda x: x["total_asset"], reverse=True)
     return ranking
 
-def get_vip_color(user_id: int):
-    user = get_user(user_id)
 
-    if not user:
-        return 0xCD7F32
+# =========================
+# 구금
+# =========================
 
-    update_vip(user_id)
+def get_jails():
+    jails = get_global_data("jails", {})
 
-    colors = {
-        "Bronze": 0xCD7F32,   # 갈색
-        "Silver": 0xC0C0C0,   # 은색
-        "Gold": 0xFFD700,     # 금색
-        "Diamond": 0x00FFFF,  # 하늘색
-        "Black": 0x2C2F33     # 검정
+    for user_id, until_time in list(jails.items()):
+        jails[user_id] = _parse_datetime(until_time)
+
+    return jails
+
+
+def save_jails(jails: dict):
+    serializable = {
+        str(user_id): until_time
+        for user_id, until_time in jails.items()
     }
+    save_global_data("jails", serializable)
 
-    return colors.get(user["vip"], 0xCD7F32)
 
-jackpots = {}
+def set_jail(user_id: int, until_time):
+    jails = get_jails()
+    jails[str(user_id)] = until_time
+    save_jails(jails)
+
+
+def get_jail(user_id: int):
+    jails = get_jails()
+    return jails.get(str(user_id))
+
+
+def is_jailed(user_id: int):
+    jails = get_jails()
+    until_time = jails.get(str(user_id))
+
+    if not until_time:
+        return False
+
+    if datetime.now() >= until_time:
+        del jails[str(user_id)]
+        save_jails(jails)
+        return False
+
+    return True
+
+
+def get_jail_remaining(user_id: int):
+    jails = get_jails()
+    until_time = jails.get(str(user_id))
+
+    if not until_time:
+        return None
+
+    remaining = until_time - datetime.now()
+
+    if remaining.total_seconds() <= 0:
+        del jails[str(user_id)]
+        save_jails(jails)
+        return None
+
+    return remaining
+
+
+def clear_jail(user_id: int):
+    jails = get_jails()
+
+    if str(user_id) in jails:
+        del jails[str(user_id)]
+        save_jails(jails)
+
+
+def add_jail_time(user_id: int, minutes: int):
+    jails = get_jails()
+    until_time = jails.get(str(user_id))
+
+    if not until_time or datetime.now() >= until_time:
+        jails[str(user_id)] = datetime.now() + timedelta(minutes=minutes)
+    else:
+        jails[str(user_id)] = until_time + timedelta(minutes=minutes)
+
+    save_jails(jails)
+    return jails[str(user_id)]
+
+
+# =========================
+# 잭팟
+# =========================
 
 def get_jackpot(guild_id: int):
-    if guild_id not in jackpots:
-        jackpots[guild_id] = {
-            "amount": 0,
-            "last_winner": None,
-            "last_amount": 0
-        }
-
-    return jackpots[guild_id]
+    data = get_guild_data(guild_id)
+    return data["jackpot"]
 
 
 def add_jackpot(guild_id: int, amount: int):
-    jackpot = get_jackpot(guild_id)
-    jackpot["amount"] += amount
-    return jackpot["amount"]
+    data = get_guild_data(guild_id)
+    data["jackpot"]["amount"] += amount
+
+    save_guild_data(guild_id, data)
+    return data["jackpot"]["amount"]
+
 
 def claim_jackpot(guild_id: int, user_id: int):
-    jackpot = get_jackpot(guild_id)
+    data = get_guild_data(guild_id)
+    jackpot = data["jackpot"]
 
     amount = jackpot["amount"]
 
@@ -335,26 +657,24 @@ def claim_jackpot(guild_id: int, user_id: int):
     jackpot["last_winner"] = user_id
     jackpot["last_amount"] = amount
 
+    save_guild_data(guild_id, data)
     add_money(user_id, amount)
 
     return amount
 
-guild_settings = {}
+
+# =========================
+# 서버 설정
+# =========================
 
 def get_guild_settings(guild_id: int):
-    if guild_id not in guild_settings:
-        guild_settings[guild_id] = {
-            "notice_channel": None,
-            "lotto_channel": None,
-            "jackpot_channel": None,
-            "stock_channel": None
-        }
-
-    return guild_settings[guild_id]
+    data = get_guild_data(guild_id)
+    return data["settings"]
 
 
 def set_guild_channel(guild_id: int, channel_type: str, channel_id: int):
-    settings = get_guild_settings(guild_id)
+    data = get_guild_data(guild_id)
+    settings = data["settings"]
 
     channel_keys = {
         "공지": "notice_channel",
@@ -369,6 +689,7 @@ def set_guild_channel(guild_id: int, channel_type: str, channel_id: int):
     key = channel_keys[channel_type]
     settings[key] = channel_id
 
+    save_guild_data(guild_id, data)
     return settings
 
 
@@ -394,31 +715,51 @@ def get_guild_channel(guild_id: int, channel_type: str):
 
     return settings.get("notice_channel")
 
-lotto_tickets = {}
-lotto_last_draw_date = {}
+
+# =========================
+# 로또
+# =========================
 
 def buy_lotto_ticket(guild_id: int, user_id: int, numbers: list):
-    if guild_id not in lotto_tickets:
-        lotto_tickets[guild_id] = []
+    data = get_guild_data(guild_id)
 
-    lotto_tickets[guild_id].append({
+    data["lotto_tickets"].append({
         "user_id": user_id,
         "numbers": numbers
     })
 
+    save_guild_data(guild_id, data)
+
+
 def get_lotto_tickets(guild_id: int):
-    return lotto_tickets.get(guild_id, [])
+    data = get_guild_data(guild_id)
+    return data["lotto_tickets"]
+
 
 def clear_lotto_tickets(guild_id: int):
-    lotto_tickets[guild_id] = []
+    data = get_guild_data(guild_id)
+    data["lotto_tickets"] = []
+    save_guild_data(guild_id, data)
+
 
 def get_lotto_last_draw_date(guild_id: int):
-    return lotto_last_draw_date.get(guild_id)
+    data = get_guild_data(guild_id)
+
+    last_date = data.get("lotto_last_draw_date")
+    return _parse_date(last_date)
+
 
 def set_lotto_last_draw_date(guild_id: int, draw_date):
-    lotto_last_draw_date[guild_id] = draw_date
+    data = get_guild_data(guild_id)
+    data["lotto_last_draw_date"] = draw_date
+    save_guild_data(guild_id, data)
 
-stocks = {
+
+# =========================
+# 주식
+# =========================
+
+DEFAULT_STOCKS = {
     "K전자": {"price": 10000, "last_change": 0},
     "노브코인": {"price": 5000, "last_change": 0},
     "카지노홀딩스": {"price": 50000, "last_change": 0},
@@ -426,7 +767,16 @@ stocks = {
     "블랙그룹": {"price": 500000, "last_change": 0},
 }
 
-user_stocks = {}
+stocks = {}
+
+
+def init_stocks():
+    global stocks
+    stocks = get_global_data("stocks", DEFAULT_STOCKS.copy())
+
+
+def save_stocks():
+    save_global_data("stocks", stocks)
 
 
 def get_stocks():
@@ -438,10 +788,13 @@ def get_stock(name: str):
 
 
 def get_user_stocks(user_id: int):
-    if user_id not in user_stocks:
-        user_stocks[user_id] = {}
+    user = get_user(user_id)
 
-    return user_stocks[user_id]
+    if not user:
+        return {}
+
+    user.setdefault("stocks", {})
+    return user["stocks"]
 
 
 def buy_stock(user_id: int, stock_name: str, quantity: int):
@@ -458,7 +811,7 @@ def buy_stock(user_id: int, stock_name: str, quantity: int):
 
     user["money"] -= total_price
 
-    portfolio = get_user_stocks(user_id)
+    portfolio = user.setdefault("stocks", {})
 
     if stock_name not in portfolio:
         portfolio[stock_name] = {
@@ -475,17 +828,20 @@ def buy_stock(user_id: int, stock_name: str, quantity: int):
     portfolio[stock_name]["quantity"] = new_qty
     portfolio[stock_name]["avg_price"] = new_avg
 
-    update_vip(user_id)
+    update_vip_data(user)
+    save_user(user_id, user)
+
     return user
 
 
 def sell_stock(user_id: int, stock_name: str, quantity: int):
     user = get_user(user_id)
     stock = get_stock(stock_name)
-    portfolio = get_user_stocks(user_id)
 
     if not user or not stock or quantity <= 0:
         return None
+
+    portfolio = user.setdefault("stocks", {})
 
     if stock_name not in portfolio:
         return None
@@ -502,10 +858,15 @@ def sell_stock(user_id: int, stock_name: str, quantity: int):
 
     user["money"] += total_price
 
-    update_vip(user_id)
+    update_vip_data(user)
+    save_user(user_id, user)
+
     return user
 
-import random
+
+# =========================
+# 부동산
+# =========================
 
 real_estates = {
     "원룸": {
@@ -545,9 +906,7 @@ def get_user_properties(user_id: int):
     if not user:
         return []
 
-    if "properties" not in user:
-        user["properties"] = []
-
+    user.setdefault("properties", [])
     return user["properties"]
 
 
@@ -557,8 +916,7 @@ def buy_property(user_id: int, property_name: str):
     if not user:
         return None
 
-    if "properties" not in user:
-        user["properties"] = []
+    user.setdefault("properties", [])
 
     if property_name not in real_estates:
         return None
@@ -574,7 +932,9 @@ def buy_property(user_id: int, property_name: str):
     user["money"] -= price
     user["properties"].append(property_name)
 
-    update_vip(user_id)
+    update_vip_data(user)
+    save_user(user_id, user)
+
     return user
 
 
@@ -584,8 +944,7 @@ def sell_property(user_id: int, property_name: str):
     if not user:
         return None
 
-    if "properties" not in user:
-        user["properties"] = []
+    user.setdefault("properties", [])
 
     if property_name not in user["properties"]:
         return None
@@ -595,7 +954,9 @@ def sell_property(user_id: int, property_name: str):
     user["properties"].remove(property_name)
     user["money"] += sell_price
 
-    update_vip(user_id)
+    update_vip_data(user)
+    save_user(user_id, user)
+
     return sell_price
 
 
@@ -605,11 +966,8 @@ def claim_property_income(user_id: int):
     if not user:
         return None
 
-    if "properties" not in user:
-        user["properties"] = []
-
-    if "property_last_claim" not in user:
-        user["property_last_claim"] = None
+    user.setdefault("properties", [])
+    user.setdefault("property_last_claim", None)
 
     if not user["properties"]:
         return None
@@ -636,7 +994,8 @@ def claim_property_income(user_id: int):
     user["money"] += total_income
     user["property_last_claim"] = now
 
-    update_vip(user_id)
+    update_vip_data(user)
+    save_user(user_id, user)
 
     return {
         "success": True,
@@ -645,22 +1004,14 @@ def claim_property_income(user_id: int):
         "money": user["money"]
     }
 
-casinos = {}
 
-CASINO_PRICE = 50_000
-
+# =========================
+# 카지노
+# =========================
 
 def get_casino(guild_id: int):
-    if guild_id not in casinos:
-        casinos[guild_id] = {
-            "owner_id": None,
-            "value": CASINO_PRICE,
-            "vault": 0,
-            "total_profit": 0,
-            "protected_until": None
-        }
-
-    return casinos[guild_id]
+    data = get_guild_data(guild_id)
+    return data["casino"]
 
 
 def buy_casino(guild_id: int, user_id: int):
@@ -669,7 +1020,8 @@ def buy_casino(guild_id: int, user_id: int):
     if not user:
         return None
 
-    casino = get_casino(guild_id)
+    data = get_guild_data(guild_id)
+    casino = data["casino"]
 
     if casino["owner_id"] is not None:
         return None
@@ -684,7 +1036,10 @@ def buy_casino(guild_id: int, user_id: int):
     casino["total_profit"] = 0
     casino["protected_until"] = datetime.now() + timedelta(days=3)
 
-    update_vip(user_id)
+    update_vip_data(user)
+
+    save_user(user_id, user)
+    save_guild_data(guild_id, data)
 
     return casino
 
@@ -695,7 +1050,8 @@ def is_casino_owner(guild_id: int, user_id: int):
 
 
 def add_casino_vault(guild_id: int, amount: int):
-    casino = get_casino(guild_id)
+    data = get_guild_data(guild_id)
+    casino = data["casino"]
 
     if casino["owner_id"] is None:
         return 0
@@ -703,11 +1059,13 @@ def add_casino_vault(guild_id: int, amount: int):
     casino["vault"] += amount
     casino["total_profit"] += amount
 
+    save_guild_data(guild_id, data)
     return casino["vault"]
 
 
 def claim_casino_vault(guild_id: int, user_id: int):
-    casino = get_casino(guild_id)
+    data = get_guild_data(guild_id)
+    casino = data["casino"]
 
     if casino["owner_id"] != user_id:
         return None
@@ -718,16 +1076,17 @@ def claim_casino_vault(guild_id: int, user_id: int):
         return 0
 
     casino["vault"] = 0
+
+    save_guild_data(guild_id, data)
     add_money(user_id, amount)
 
     return amount
 
 
 def rob_casino(guild_id: int, user_id: int):
-    import random
-
     user = get_user(user_id)
-    casino = get_casino(guild_id)
+    data = get_guild_data(guild_id)
+    casino = data["casino"]
 
     if not user:
         return None
@@ -748,6 +1107,8 @@ def rob_casino(guild_id: int, user_id: int):
         stolen = int(casino["vault"] * percent / 100)
 
         casino["vault"] -= stolen
+
+        save_guild_data(guild_id, data)
         add_money(user_id, stolen)
 
         return {
@@ -764,7 +1125,8 @@ def rob_casino(guild_id: int, user_id: int):
 
 def acquire_casino(guild_id: int, buyer_id: int, amount: int):
     buyer = get_user(buyer_id)
-    casino = get_casino(guild_id)
+    data = get_guild_data(guild_id)
+    casino = data["casino"]
 
     if not buyer:
         return None
@@ -804,7 +1166,8 @@ def acquire_casino(guild_id: int, buyer_id: int, amount: int):
     if old_owner:
         old_owner["money"] += amount
         old_owner["money"] += old_vault
-        update_vip(old_owner_id)
+        update_vip_data(old_owner)
+        save_user(old_owner_id, old_owner)
 
     casino["owner_id"] = buyer_id
     casino["value"] = amount
@@ -812,7 +1175,10 @@ def acquire_casino(guild_id: int, buyer_id: int, amount: int):
     casino["total_profit"] = 0
     casino["protected_until"] = datetime.now() + timedelta(days=3)
 
-    update_vip(buyer_id)
+    update_vip_data(buyer)
+
+    save_user(buyer_id, buyer)
+    save_guild_data(guild_id, data)
 
     return {
         "success": True,
@@ -823,9 +1189,8 @@ def acquire_casino(guild_id: int, buyer_id: int, amount: int):
         "protected_until": casino["protected_until"]
     }
 
-def casino_owner_bonus(guild_id: int, user_id: int):
-    import random
 
+def casino_owner_bonus(guild_id: int, user_id: int):
     casino = get_casino(guild_id)
 
     if casino["owner_id"] != user_id:

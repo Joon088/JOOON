@@ -93,8 +93,12 @@ dice.setup(bot)
 casino.setup(bot)
 
 
+from db import init_db
+
 @bot.event
 async def on_ready():
+
+    init_db()
 
     synced = await bot.tree.sync()
 
